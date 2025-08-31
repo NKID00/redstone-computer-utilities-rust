@@ -1,15 +1,26 @@
-use log::info;
-use redstone_computer_utilities::{ResponseOrErrorCode, Result, Script};
+use redstone_computer_utilities::{QueryGametimeResult, Result, Script};
+use tracing::info;
+use tracing_subscriber::EnvFilter;
 
-fn main() -> Result<()> {
-    Script::new()
-        .on_init(|_ctx| {
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
+    Script::new("hello")
+        .on_init(async |mut ctx| {
             info!("on_init is called!");
-            ResponseOrErrorCode::Ok(serde_json::json!({}))
+            ctx.info("on_init is called!").await?;
+            Ok(())
         })
-        .on_execute(|_ctx| {
+        .on_execute(async |mut ctx| {
             info!("on_execute is called!");
-            ResponseOrErrorCode::Ok(serde_json::json!({}))
+            ctx.info("on_execute is called!").await?;
+            let QueryGametimeResult { gametime } = ctx.query_gametime().await?;
+            info!("gametime = {gametime}");
+            ctx.info(format!("gametime = {gametime}")).await?;
+            Ok(1)
         })
         .run()
+        .await
 }

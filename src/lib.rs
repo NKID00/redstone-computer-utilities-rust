@@ -1,18 +1,20 @@
 mod datatype;
 
-use std::{
-    net::TcpStream,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
-use log::*;
-
+use futures::{FutureExt, SinkExt, TryStreamExt, future::BoxFuture};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
-use serde_json::json;
-use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
+use serde::de::DeserializeOwned;
+use serde_json::Value;
+use tokio::{net::TcpStream, select, signal::ctrl_c, sync::Mutex};
+use tokio_tungstenite::{
+    MaybeTlsStream, WebSocketStream, connect_async,
+    tungstenite::{self, Message},
+};
+use tracing::{debug, error, info, trace};
+use trait_set::trait_set;
 
-pub use crate::datatype::ResponseOrErrorCode;
-use crate::datatype::{ApiRequest, ApiResult, Event, EventParam, EventResponse};
+pub use crate::datatype::*;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -24,27 +26,44 @@ pub enum Error {
     InvalidServerMessage,
     #[error("unexpected disconnect from server")]
     UnexpectedDisconnect,
+    #[error("scriptInitialize callback returned Err")]
+    InitializeFailed,
+    #[error("failed to serialize message")]
+    SerializeFailed(#[from] serde_json::Error),
+    #[error("error code from server")]
+    ErrorCode(#[from] ErrorCode),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+trait_set! {
+    trait OnInitCallback = FnOnce(Context) -> BoxFuture<'static, std::result::Result<(), ErrorCode>>;
+    trait OnExecuteCallback = Fn(Context) -> BoxFuture<'static, std::result::Result<i32, ErrorCode>>;
+}
 
 pub struct Script {
     name: String,
     description: String,
     server: String,
-    on_init: Option<Box<dyn FnOnce(&mut Context) -> ResponseOrErrorCode>>,
-    on_execute: Option<Arc<dyn Fn(&mut Context) -> ResponseOrErrorCode>>,
+    on_init: Option<Box<dyn OnInitCallback + Send>>,
+    on_execute: Option<Arc<dyn OnExecuteCallback + Send + Sync>>,
 }
 
-impl Script {
-    pub fn new() -> Self {
+impl Default for Script {
+    fn default() -> Self {
         Self {
-            name: "".to_owned(),
+            name: "example".to_owned(),
             description: "".to_owned(),
-            server: "ws://localhost:32765/".to_owned(),
+            server: "ws://localhost:37265/".to_owned(),
             on_init: None,
             on_execute: None,
         }
+    }
+}
+
+impl Script {
+    pub fn new(name: impl AsRef<str>) -> Self {
+        Self::default().name(name)
     }
 
     pub fn name(mut self, name: impl AsRef<str>) -> Self {
@@ -62,23 +81,25 @@ impl Script {
         self
     }
 
-    pub fn on_init<F: FnOnce(&mut Context) -> ResponseOrErrorCode + 'static>(
-        mut self,
-        callback: F,
-    ) -> Self {
-        self.on_init = Some(Box::new(callback));
+    pub fn on_init<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: FnOnce(Context) -> Fut + Send + 'static,
+        Fut: Future<Output = std::result::Result<(), ErrorCode>> + Send + 'static,
+    {
+        self.on_init = Some(Box::new(move |ctx| callback(ctx).boxed()));
         self
     }
 
-    pub fn on_execute<F: Fn(&mut Context) -> ResponseOrErrorCode + 'static>(
-        mut self,
-        callback: F,
-    ) -> Self {
-        self.on_execute = Some(Arc::new(callback));
+    pub fn on_execute<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<i32, ErrorCode>> + Send + 'static,
+    {
+        self.on_execute = Some(Arc::new(move |ctx| callback(ctx).boxed()));
         self
     }
 
-    pub fn run(self) -> Result<()> {
+    pub async fn run(self) -> Result<()> {
         info!("Connecting to server");
         let url = format!(
             "{}?name={}&description={}",
@@ -86,63 +107,82 @@ impl Script {
             url_encode_query(&self.name),
             url_encode_query(&self.description)
         );
-        let (ws, _) = connect(url)?;
+        let (ws, _) = connect_async(url).await?;
+        let ws = Arc::new(Mutex::new(ws));
         Context {
-            script: self,
-            ws: Arc::new(Mutex::new(ws)),
+            script: Arc::new(Mutex::new(self)),
+            ws: ws.clone(),
         }
         .main_loop()
+        .await?;
+        let mut lock = ws.lock().await;
+        lock.close(None).await?;
+        lock.flush().await?;
+        Ok(())
     }
 }
 
+#[derive(Clone)]
 pub struct Context {
-    script: Script,
-    ws: Arc<Mutex<WebSocket<MaybeTlsStream<TcpStream>>>>,
+    script: Arc<Mutex<Script>>,
+    ws: Arc<Mutex<WebSocketStream<MaybeTlsStream<TcpStream>>>>,
 }
 
 impl Context {
-    fn main_loop(&mut self) -> Result<()> {
+    async fn main_loop(&mut self) -> Result<()> {
+        info!("Connected");
         loop {
-            let Some(evt) = self.try_next_event()? else {
+            let Some(evt) = self.try_next_event().await? else {
                 return Ok(());
             };
-            self.handle_event(evt)?;
+            Box::pin(self.handle_event(evt)).await?;
         }
     }
 
-    fn try_next_event(&mut self) -> Result<Option<Event>> {
-        match self.try_next_event_or_api_result()? {
+    async fn try_next_event(&mut self) -> Result<Option<Event>> {
+        match self.try_next_event_or_api_result().await? {
             Some(EventOrApiResult::Event(evt)) => Ok(Some(evt)),
             Some(EventOrApiResult::ApiResult(res)) => {
-                error!("unexpected api response {res:?}");
+                error!("unexpected api result {res:?}");
                 Err(Error::UnexpectedApiResult)
             }
             None => Ok(None),
         }
     }
 
-    fn try_next_event_or_api_result(&mut self) -> Result<Option<EventOrApiResult>> {
-        let Some(s) = self.try_next_message()? else {
+    async fn try_next_event_or_api_result(&mut self) -> Result<Option<EventOrApiResult>> {
+        let Some(s) = self.try_next_message().await? else {
             return Ok(None);
         };
         if let Ok(evt) = serde_json::from_str::<Event>(&s) {
             trace!("event request {evt:?}");
             return Ok(Some(EventOrApiResult::Event(evt)));
         }
-        if let Ok(res) = serde_json::from_str::<ApiResult>(&s) {
-            trace!("api response {res:?}");
+        if let Ok(res) = serde_json::from_str::<ApiResultWrapper>(&s) {
+            trace!("api result {res:?}");
             return Ok(Some(EventOrApiResult::ApiResult(res)));
         }
         error!("unrecognized server message {s:?}");
-        return Err(Error::InvalidServerMessage);
+        Err(Error::InvalidServerMessage)
     }
 
-    fn try_next_message(&mut self) -> Result<Option<String>> {
+    async fn try_next_message(&mut self) -> Result<Option<String>> {
         loop {
-            match {
-                let mut lock = self.ws.lock().unwrap();
-                lock.read()?
-            } {
+            let Some(message) = ({
+                let mut lock = self.ws.lock().await;
+                select! {
+                    message = lock.try_next() => {
+                        message?
+                    }
+                    _ = ctrl_c() => {
+                        info!("Shutdown");
+                        return Ok(None);
+                    }
+                }
+            }) else {
+                return Ok(None);
+            };
+            match message {
                 Message::Text(bytes) => return Ok(Some(bytes.to_string())),
                 Message::Binary(b) => {
                     error!("unrecognized server message {b:?}");
@@ -154,63 +194,151 @@ impl Context {
         }
     }
 
-    fn handle_event(&mut self, evt: Event) -> Result<()> {
+    async fn handle_event(&mut self, evt: Event) -> Result<()> {
         match evt {
             Event::ScriptInitialize {} => {
-                if self.script.on_execute.is_some() {
-                    self.subscribe_run();
+                info!("Initializing");
+                if self.script.lock().await.on_execute.is_some() {
+                    self.subscribe_run().await?;
                 }
-                if let Some(callback) = self.script.on_init.take() {
-                    let resp = callback(self);
-                    self.send_event_response(EventResponse { finish: resp })?;
-                } else {
-                    self.send_event_response(EventResponse::ok(json!({})))?;
+                if let Some(callback) = { self.script.lock().await.on_init.take() } {
+                    debug!("Call on_init");
+                    let result = callback(self.clone()).await;
+                    if let Err(e) = result {
+                        self.send_event_response(EventResponse::Err(e)).await?;
+                        return Err(Error::InitializeFailed);
+                    }
                 }
+                self.send_event_response(EventResponse::empty()).await?;
+                info!("Running");
             }
-            Event::ScriptRun {} => {
-                if let Some(callback) = &self.script.on_execute {
+            Event::ScriptRun { .. } => {
+                // TODO: content
+                let result = if let Some(callback) = { self.script.lock().await.on_execute.clone() }
+                {
+                    debug!("Call on_execute");
                     let callback = callback.clone();
-                    let resp = callback(self);
-                    self.send_event_response(EventResponse { finish: resp })?;
+                    let result = callback(self.clone()).await;
+                    match result {
+                        Ok(result) => result,
+                        Err(e) => {
+                            self.send_event_response(EventResponse::Err(e)).await?;
+                            return Ok(());
+                        }
+                    }
                 } else {
-                    self.send_event_response(EventResponse::ok(json!({})))?;
-                }
+                    0
+                };
+                self.send_event_response(EventResponse::ScriptRun { result })
+                    .await?;
             }
+            // TODO: impl
+            Event::InterfaceChange { .. } => {}
+            Event::BlockUpdate { .. } => {}
+            Event::Alarm { .. } => {}
         }
         Ok(())
     }
 
-    fn send_event_response(&mut self, resp: EventResponse) -> Result<()> {
-        let mut lock = self.ws.lock().unwrap();
-        lock.send(Message::Text(serde_json::to_string(&resp).unwrap().into()))?;
+    async fn send_event_response(&mut self, resp: EventResponse) -> Result<()> {
+        trace!("event response {resp:?}");
+        self.send(serde_json::to_string(&EventResponseWrapper {
+            finish: resp,
+        })?)
+        .await?;
         Ok(())
     }
 
-    fn send_api_request(&mut self, req: ApiRequest) -> Result<ApiResult> {
-        {
-            let mut lock = self.ws.lock().unwrap();
-            lock.send(Message::Text(serde_json::to_string(&req).unwrap().into()))?;
-        }
+    async fn send_api_request<T: DeserializeOwned>(&mut self, req: ApiRequest) -> Result<T> {
+        trace!("api request {req:?}");
+        self.send(serde_json::to_string(&req)?).await?;
         loop {
-            match self.try_next_event_or_api_result()? {
-                Some(EventOrApiResult::ApiResult(res)) => return Ok(res),
-                Some(EventOrApiResult::Event(evt)) => self.handle_event(evt)?,
+            match self.try_next_event_or_api_result().await? {
+                Some(EventOrApiResult::ApiResult(res)) => {
+                    let value = res.result.into_result()?;
+                    return Ok(serde_json::from_value(value)?);
+                }
+                Some(EventOrApiResult::Event(evt)) => Box::pin(self.handle_event(evt)).await?,
                 None => return Err(Error::UnexpectedDisconnect),
             }
         }
     }
 
-    pub fn subscribe_run(&mut self) {
-        self.send_api_request(ApiRequest::Subscribe(EventParam::ScriptRun {}))
-            .unwrap();
+    async fn send_api_request_discard_result(&mut self, req: ApiRequest) -> Result<()> {
+        self.send_api_request::<Value>(req).await?;
+        Ok(())
     }
 
-    pub fn info(&mut self, message: impl AsRef<str>) {
-        self.send_api_request(ApiRequest::Log {
-            message: message.as_ref().to_owned(),
-            level: datatype::LogLevel::Info,
+    async fn send(&mut self, message: String) -> Result<()> {
+        let mut lock = self.ws.lock().await;
+        lock.send(Message::Text(message.into())).await?;
+        Ok(())
+    }
+
+    pub async fn subscribe_run(&mut self) -> Result<()> {
+        self.send_api_request_discard_result(ApiRequest::Subscribe(SubscribeParam::ScriptRun {}))
+            .await
+    }
+
+    pub async fn read_interface(&mut self, name: impl AsRef<str>) -> Result<ReadInterfaceResult> {
+        self.send_api_request(ApiRequest::ReadInterface {
+            name: name.as_ref().to_owned(),
         })
-        .unwrap();
+        .await
+    }
+
+    pub async fn write_interface(
+        &mut self,
+        name: impl AsRef<str>,
+        value: impl AsRef<str>,
+    ) -> Result<()> {
+        self.send_api_request_discard_result(ApiRequest::WriteInterface {
+            name: name.as_ref().to_owned(),
+            value: value.as_ref().to_owned(),
+        })
+        .await
+    }
+
+    pub async fn query_gametime(&mut self) -> Result<QueryGametimeResult> {
+        self.send_api_request(ApiRequest::QueryGametime {}).await
+    }
+
+    pub async fn execute_command(
+        &mut self,
+        command: impl AsRef<str>,
+    ) -> Result<ExecuteCommandResult> {
+        self.send_api_request(ApiRequest::ExecuteCommand {
+            command: command.as_ref().to_owned(),
+        })
+        .await
+    }
+
+    pub async fn log(&mut self, message: impl AsRef<str>, level: LogLevel) -> Result<()> {
+        self.send_api_request_discard_result(ApiRequest::Log {
+            message: message.as_ref().to_owned(),
+            level,
+        })
+        .await
+    }
+
+    pub async fn debug(&mut self, message: impl AsRef<str>) -> Result<()> {
+        self.log(message, LogLevel::Debug).await
+    }
+
+    pub async fn info(&mut self, message: impl AsRef<str>) -> Result<()> {
+        self.log(message, LogLevel::Info).await
+    }
+
+    pub async fn warn(&mut self, message: impl AsRef<str>) -> Result<()> {
+        self.log(message, LogLevel::Warn).await
+    }
+
+    pub async fn error(&mut self, message: impl AsRef<str>) -> Result<()> {
+        self.log(message, LogLevel::Error).await
+    }
+
+    pub async fn fatal(&mut self, message: impl AsRef<str>) -> Result<()> {
+        self.log(message, LogLevel::Fatal).await
     }
 }
 
@@ -222,5 +350,5 @@ fn url_encode_query(s: &str) -> String {
 #[derive(Debug, Clone)]
 pub(crate) enum EventOrApiResult {
     Event(Event),
-    ApiResult(ApiResult),
+    ApiResult(ApiResultWrapper),
 }
