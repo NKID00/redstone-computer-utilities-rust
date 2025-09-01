@@ -136,13 +136,13 @@ pub(crate) enum Event {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ScriptRunContent {
-    argument: Vec<serde_json::Value>,
+    pub(crate) argument: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct InterfaceChangeContent {
-    previous: String,
-    current: String,
+    pub(crate) previous: String,
+    pub(crate) current: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

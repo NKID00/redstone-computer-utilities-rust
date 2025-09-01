@@ -5,6 +5,7 @@ use std::sync::Arc;
 use futures::{FutureExt, SinkExt, TryStreamExt, future::BoxFuture};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde::de::DeserializeOwned;
+pub use serde_json;
 use serde_json::Value;
 use tokio::{net::TcpStream, select, signal::ctrl_c, sync::Mutex};
 use tokio_tungstenite::{
@@ -38,7 +39,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 trait_set! {
     trait OnInitCallback = FnOnce(Context) -> BoxFuture<'static, std::result::Result<(), ErrorCode>>;
-    trait OnExecuteCallback = Fn(Context) -> BoxFuture<'static, std::result::Result<i32, ErrorCode>>;
+    trait OnExecuteCallback = Fn(Context, Vec<serde_json::Value>) -> BoxFuture<'static, std::result::Result<i32, ErrorCode>>;
 }
 
 pub struct Script {
@@ -92,10 +93,10 @@ impl Script {
 
     pub fn on_execute<F, Fut>(mut self, callback: F) -> Self
     where
-        F: Fn(Context) -> Fut + Send + Sync + 'static,
+        F: Fn(Context, Vec<serde_json::Value>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = std::result::Result<i32, ErrorCode>> + Send + 'static,
     {
-        self.on_execute = Some(Arc::new(move |ctx| callback(ctx).boxed()));
+        self.on_execute = Some(Arc::new(move |ctx, args| callback(ctx, args).boxed()));
         self
     }
 
@@ -212,13 +213,11 @@ impl Context {
                 self.send_event_response(EventResponse::empty()).await?;
                 info!("Running");
             }
-            Event::ScriptRun { .. } => {
-                // TODO: content
+            Event::ScriptRun { content } => {
                 let result = if let Some(callback) = { self.script.lock().await.on_execute.clone() }
                 {
                     debug!("Call on_execute");
-                    let callback = callback.clone();
-                    let result = callback(self.clone()).await;
+                    let result = callback(self.clone(), content.argument).await;
                     match result {
                         Ok(result) => result,
                         Err(e) => {

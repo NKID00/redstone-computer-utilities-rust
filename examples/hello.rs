@@ -13,7 +13,7 @@ async fn main() -> Result<()> {
             ctx.info("on_init is called!").await?;
             Ok(())
         })
-        .on_execute(async |mut ctx| {
+        .on_execute(async |mut ctx, _args| {
             info!("on_execute is called!");
             ctx.info("on_execute is called!").await?;
             let QueryGametimeResult { gametime } = ctx.query_gametime().await?;
