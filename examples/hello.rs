@@ -1,4 +1,4 @@
-use redstone_computer_utilities::{QueryGametimeResult, Result, Script};
+use redstone_computer_utilities::{Result, Script};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -16,7 +16,7 @@ async fn main() -> Result<()> {
         .on_execute(async |mut ctx, _args| {
             info!("on_execute is called!");
             ctx.info("on_execute is called!").await?;
-            let QueryGametimeResult { gametime } = ctx.query_gametime().await?;
+            let gametime = ctx.query_gametime().await?;
             info!("gametime = {gametime}");
             ctx.info(format!("gametime = {gametime}")).await?;
             Ok(1)

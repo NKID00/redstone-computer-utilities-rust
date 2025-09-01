@@ -279,11 +279,13 @@ impl Context {
             .await
     }
 
-    pub async fn read_interface(&mut self, name: impl AsRef<str>) -> Result<ReadInterfaceResult> {
-        self.send_api_request(ApiRequest::ReadInterface {
-            name: name.as_ref().to_owned(),
-        })
-        .await
+    pub async fn read_interface(&mut self, name: impl AsRef<str>) -> Result<String> {
+        let result: ReadInterfaceResult = self
+            .send_api_request(ApiRequest::ReadInterface {
+                name: name.as_ref().to_owned(),
+            })
+            .await?;
+        Ok(result.value)
     }
 
     pub async fn write_interface(
@@ -298,8 +300,10 @@ impl Context {
         .await
     }
 
-    pub async fn query_gametime(&mut self) -> Result<QueryGametimeResult> {
-        self.send_api_request(ApiRequest::QueryGametime {}).await
+    pub async fn query_gametime(&mut self) -> Result<i64> {
+        let result: QueryGametimeResult =
+            self.send_api_request(ApiRequest::QueryGametime {}).await?;
+        Ok(result.gametime)
     }
 
     pub async fn execute_command(

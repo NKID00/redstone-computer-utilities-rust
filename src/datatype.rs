@@ -99,13 +99,13 @@ impl ApiResult {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct ReadInterfaceResult {
-    pub value: String,
+pub(crate) struct ReadInterfaceResult {
+    pub(crate) value: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct QueryGametimeResult {
-    pub gametime: i64,
+pub(crate) struct QueryGametimeResult {
+    pub(crate) gametime: i64,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
