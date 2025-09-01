@@ -1,6 +1,6 @@
 mod datatype;
 
-use std::sync::Arc;
+use std::{fmt::Debug, sync::Arc};
 
 use futures::{FutureExt, SinkExt, TryStreamExt, future::BoxFuture};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -12,15 +12,15 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream, connect_async,
     tungstenite::{self, Message},
 };
-use tracing::{debug, error, info, trace};
+use tracing::{error, info, instrument, trace};
 use trait_set::trait_set;
 
 pub use crate::datatype::*;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("unexpected websocket error")]
-    WebsocketError(#[from] tungstenite::Error),
+    WebsocketError(#[from] Box<tungstenite::Error>),
     #[error("unexpected api result from server while no api request was pending")]
     UnexpectedApiResult,
     #[error("invalid message from server")]
@@ -33,6 +33,12 @@ pub enum Error {
     SerializeFailed(#[from] serde_json::Error),
     #[error("error code from server")]
     ErrorCode(#[from] ErrorCode),
+}
+
+impl From<tungstenite::Error> for Error {
+    fn from(value: tungstenite::Error) -> Self {
+        Box::new(value).into()
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -156,11 +162,11 @@ impl Context {
             return Ok(None);
         };
         if let Ok(evt) = serde_json::from_str::<Event>(&s) {
-            trace!("event request {evt:?}");
+            trace!(evt=?evt, "event request");
             return Ok(Some(EventOrApiResult::Event(evt)));
         }
         if let Ok(res) = serde_json::from_str::<ApiResultWrapper>(&s) {
-            trace!("api result {res:?}");
+            trace!(res=?res, "api result");
             return Ok(Some(EventOrApiResult::ApiResult(res)));
         }
         error!("unrecognized server message {s:?}");
@@ -199,38 +205,10 @@ impl Context {
         match evt {
             Event::ScriptInitialize {} => {
                 info!("Initializing");
-                if self.script.lock().await.on_execute.is_some() {
-                    self.subscribe_run().await?;
-                }
-                if let Some(callback) = { self.script.lock().await.on_init.take() } {
-                    debug!("Call on_init");
-                    let result = callback(self.clone()).await;
-                    if let Err(e) = result {
-                        self.send_event_response(EventResponse::Err(e)).await?;
-                        return Err(Error::InitializeFailed);
-                    }
-                }
-                self.send_event_response(EventResponse::empty()).await?;
+                self.on_init().await?;
                 info!("Running");
             }
-            Event::ScriptRun { content } => {
-                let result = if let Some(callback) = { self.script.lock().await.on_execute.clone() }
-                {
-                    debug!("Call on_execute");
-                    let result = callback(self.clone(), content.argument).await;
-                    match result {
-                        Ok(result) => result,
-                        Err(e) => {
-                            self.send_event_response(EventResponse::Err(e)).await?;
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    0
-                };
-                self.send_event_response(EventResponse::ScriptRun { result })
-                    .await?;
-            }
+            Event::ScriptRun { content } => self.on_execute(content).await?,
             // TODO: impl
             Event::InterfaceChange { .. } => {}
             Event::BlockUpdate { .. } => {}
@@ -240,7 +218,7 @@ impl Context {
     }
 
     async fn send_event_response(&mut self, resp: EventResponse) -> Result<()> {
-        trace!("event response {resp:?}");
+        trace!(resp=?resp, "event response");
         self.send(serde_json::to_string(&EventResponseWrapper {
             finish: resp,
         })?)
@@ -249,7 +227,7 @@ impl Context {
     }
 
     async fn send_api_request<T: DeserializeOwned>(&mut self, req: ApiRequest) -> Result<T> {
-        trace!("api request {req:?}");
+        trace!(req=?req, "api request");
         self.send(serde_json::to_string(&req)?).await?;
         loop {
             match self.try_next_event_or_api_result().await? {
@@ -274,12 +252,52 @@ impl Context {
         Ok(())
     }
 
+    #[instrument(level = "trace", skip_all)]
+    async fn on_init(&mut self) -> Result<()> {
+        if self.script.lock().await.on_execute.is_some() {
+            self.subscribe_run().await?;
+        }
+        if let Some(callback) = { self.script.lock().await.on_init.take() } {
+            let result = callback(self.clone()).await;
+            if let Err(e) = result {
+                self.send_event_response(EventResponse::Err(e)).await?;
+                return Err(Error::InitializeFailed);
+            }
+        }
+        self.send_event_response(EventResponse::empty()).await?;
+        Ok(())
+    }
+
+    #[instrument(level = "trace", skip_all)]
+    async fn on_execute(&mut self, content: ScriptRunContent) -> Result<()> {
+        let result = if let Some(callback) = { self.script.lock().await.on_execute.clone() } {
+            let result = callback(self.clone(), content.argument).await;
+            match result {
+                Ok(result) => result,
+                Err(e) => {
+                    self.send_event_response(EventResponse::Err(e)).await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            0
+        };
+        self.send_event_response(EventResponse::ScriptRun { result })
+            .await?;
+        Ok(())
+    }
+}
+
+// Public API implementation
+impl Context {
+    #[instrument(level = "trace", skip_all)]
     pub async fn subscribe_run(&mut self) -> Result<()> {
         self.send_api_request_discard_result(ApiRequest::Subscribe(SubscribeParam::ScriptRun {}))
             .await
     }
 
-    pub async fn read_interface(&mut self, name: impl AsRef<str>) -> Result<String> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn read_interface(&mut self, name: impl AsRef<str> + Debug) -> Result<String> {
         let result: ReadInterfaceResult = self
             .send_api_request(ApiRequest::ReadInterface {
                 name: name.as_ref().to_owned(),
@@ -288,10 +306,11 @@ impl Context {
         Ok(result.value)
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn write_interface(
         &mut self,
-        name: impl AsRef<str>,
-        value: impl AsRef<str>,
+        name: impl AsRef<str> + Debug,
+        value: impl AsRef<str> + Debug,
     ) -> Result<()> {
         self.send_api_request_discard_result(ApiRequest::WriteInterface {
             name: name.as_ref().to_owned(),
@@ -300,15 +319,17 @@ impl Context {
         .await
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn query_gametime(&mut self) -> Result<i64> {
         let result: QueryGametimeResult =
             self.send_api_request(ApiRequest::QueryGametime {}).await?;
         Ok(result.gametime)
     }
 
+    #[instrument(level = "trace", skip_all)]
     pub async fn execute_command(
         &mut self,
-        command: impl AsRef<str>,
+        command: impl AsRef<str> + Debug,
     ) -> Result<ExecuteCommandResult> {
         self.send_api_request(ApiRequest::ExecuteCommand {
             command: command.as_ref().to_owned(),
@@ -316,7 +337,8 @@ impl Context {
         .await
     }
 
-    pub async fn log(&mut self, message: impl AsRef<str>, level: LogLevel) -> Result<()> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn log(&mut self, message: impl AsRef<str> + Debug, level: LogLevel) -> Result<()> {
         self.send_api_request_discard_result(ApiRequest::Log {
             message: message.as_ref().to_owned(),
             level,
@@ -324,23 +346,28 @@ impl Context {
         .await
     }
 
-    pub async fn debug(&mut self, message: impl AsRef<str>) -> Result<()> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn debug(&mut self, message: impl AsRef<str> + Debug) -> Result<()> {
         self.log(message, LogLevel::Debug).await
     }
 
-    pub async fn info(&mut self, message: impl AsRef<str>) -> Result<()> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn info(&mut self, message: impl AsRef<str> + Debug) -> Result<()> {
         self.log(message, LogLevel::Info).await
     }
 
-    pub async fn warn(&mut self, message: impl AsRef<str>) -> Result<()> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn warn(&mut self, message: impl AsRef<str> + Debug) -> Result<()> {
         self.log(message, LogLevel::Warn).await
     }
 
-    pub async fn error(&mut self, message: impl AsRef<str>) -> Result<()> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn error(&mut self, message: impl AsRef<str> + Debug) -> Result<()> {
         self.log(message, LogLevel::Error).await
     }
 
-    pub async fn fatal(&mut self, message: impl AsRef<str>) -> Result<()> {
+    #[instrument(level = "trace", skip_all)]
+    pub async fn fatal(&mut self, message: impl AsRef<str> + Debug) -> Result<()> {
         self.log(message, LogLevel::Fatal).await
     }
 }
